@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Generated scan results - committed only via CI artifact upload
+results/*.csv
+results/*.xlsx
+results/*.json
+!results/.gitkeep

@@ -41,3 +41,8 @@ python scanner.py
 - Wyniki zapisywane są jako CSV, Excel i JSON w katalogu `results/`
 - Powiadomienia wysyłane są przez Telegram i/lub e-mail
 - Można też uruchomić ręcznie przez GitHub → Actions → daily-ps5-scan → Run workflow
+
+## Ograniczenia
+
+- **Allegro (główne)** używa DataDome (anti-bot) i często zwraca captcha zamiast wyników — bez proxy/stealth może pokazywać 0 ofert. Działają: OLX, Allegro Lokalnie, Pepper.
+- **Pepper** to portal z dealsami; konsole PS5 w przedziale 500–2000 zł pojawiają się tam okazjonalnie.

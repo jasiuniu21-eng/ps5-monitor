@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import asyncio
 import json
 import os
@@ -74,14 +75,15 @@ async def scrape_olx(page) -> list[dict]:
             items = soup.select("li[class*='offer'], div[class*='listing'] div[class*='card']")
 
         for item in items:
-            title_el = item.select_one("h6, a[class*='title'], h4")
+            title_el = item.select_one("h4, h6, a[class*='title']")
             price_el = item.select_one("[data-testid='ad-price'], p[class*='price'], span[class*='price']")
-            link_el = item.select_one("a[href*='/oferta']")
+            link_el = item.select_one("a[href*='/d/oferta'], a[href*='/oferta']")
 
             title = title_el.get_text(strip=True) if title_el else ""
             price_text = price_el.get_text(strip=True) if price_el else ""
             price = parse_price(price_text)
-            link = "https://www.olx.pl" + link_el["href"] if link_el and link_el.get("href","").startswith("/oferta") else ""
+            href = link_el.get("href", "") if link_el else ""
+            link = "https://www.olx.pl" + href if href.startswith("/") else href
 
             item_text_full = item.get_text(" ", strip=True).lower()
             shipping = is_shipping_available(item_text_full)
@@ -147,7 +149,7 @@ async def scrape_allegro(page) -> list[dict]:
 
 async def scrape_allegro_lokalnie(page) -> list[dict]:
     offers = []
-    url = f"https://allegrolokalnie.pl/oferty?q={QUERY}&order=newest"
+    url = f"https://allegrolokalnie.pl/oferty/q/{QUERY}"
     print(f"[Allegro Lokalnie] Scraping {url}")
     try:
         await page.goto(url, timeout=30000, wait_until="domcontentloaded")
@@ -155,18 +157,15 @@ async def scrape_allegro_lokalnie(page) -> list[dict]:
         content = await page.content()
         soup = BeautifulSoup(content, "lxml")
 
-        items = soup.select("article[class*='offer'], div[class*='offer-card'], li[class*='offer']")
+        items = soup.select("article.mlc-itembox__container")
         if not items:
-            items = soup.select("div[data-testid='offer'], div[class*='_offer']")
+            items = soup.select("article[class*='itembox'], article[class*='offer']")
 
         for item in items:
-            title_el = item.select_one("h2 a, a[class*='title'], h3 a")
-            price_el = item.select_one("span[class*='price'], span[class*='value']")
-            link_el = item.select_one("a[href*='/oferta']")
-            desc_el = item.select_one("p[class*='description'], div[class*='description'], span[class*='desc']")
-
-            title = title_el.get_text(strip=True) if title_el else ""
-            price_text = price_el.get_text(strip=True) if price_el else ""
+            link_el = item.select_one("a[href*='/oferta/']")
+            title = link_el.get_text(" ", strip=True).split("Kup teraz")[0].strip() if link_el else ""
+            price_el = item.select_one(".mlc-itembox__price, .ml-offer-price")
+            price_text = price_el.get_text(" ", strip=True) if price_el else ""
             price = parse_price(price_text)
             link = link_el["href"] if link_el and link_el.get("href") else ""
             if link and not link.startswith("http"):
@@ -206,18 +205,28 @@ def scrape_pepper() -> list[dict]:
             return offers
 
         soup = BeautifulSoup(resp.text, "lxml")
-        items = soup.select("article.thread, div.thread, li.thread")
+        items = soup.select("article.thread")
         if not items:
-            items = soup.select("[data-testid='thread'], div[class*='thread']")
+            items = soup.select("article[class*='thread'], div[class*='thread']")
+
+        price_re = re.compile(r"(\d{2,4}(?:[,.]\d{1,2})?)\s*zł", re.IGNORECASE)
 
         for item in items:
-            title_el = item.select_one("a[class*='thread-title'], h2 a, a[class*='title']")
-            price_el = item.select_one("span[class*='thread-price'], span[class*='price']")
-            link_el = item.select_one("a[class*='thread-title']")
-
+            title_el = item.select_one("a.thread-title, a.cept-tt, a.thread-link")
+            link_el = title_el
             title = title_el.get_text(strip=True) if title_el else ""
+
+            price_el = item.select_one("span.thread-price, span[class*='thread-price']")
             price_text = price_el.get_text(strip=True) if price_el else ""
             price = parse_price(price_text)
+
+            if price is None:
+                full_text = item.get_text(" ", strip=True)
+                matches = price_re.findall(full_text)
+                candidates = [parse_price(m) for m in matches]
+                candidates = [c for c in candidates if c and MIN_PRICE <= c <= MAX_PRICE]
+                price = candidates[0] if candidates else None
+
             link = link_el["href"] if link_el and link_el.get("href") else ""
             if link and not link.startswith("http"):
                 link = "https://www.pepper.pl" + link
