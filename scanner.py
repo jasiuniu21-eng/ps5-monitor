@@ -5,7 +5,6 @@ import json
 import os
 import re
 import smtplib
-import sys
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,25 +18,42 @@ from playwright.async_api import async_playwright
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-MIN_PRICE = 500
-MAX_PRICE = 2000
-QUERY = "ps5"
-
 OLX_MAX_PAGES = 10
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_THROTTLE_SEC = 4.5  # ~13 req/min, mieści się w 15 RPM free tier
+DETAIL_FETCH_TIMEOUT = 25000
 
-# Ceny referencyjne (nowe, sklepowe, czerwiec 2026) — używane do oceny ofert
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+EMAIL_TO = os.environ.get("EMAIL_TO", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# ============== KATEGORIE ==============
+
+# Ceny referencyjne (nowe, sklepowe, czerwiec 2026)
 NEW_PRICE_DIGITAL = 1899
 NEW_PRICE_SLIM_DISC = 2299
 NEW_PRICE_PRO = 3499
+NEW_PRICE_DUALSENSE = 319
+NEW_PRICE_DUALSENSE_EDGE = 949
 
-# Słowa wykluczające — to nie jest konsola, tylko gra/akcesorium
-EXCLUDE_KEYWORDS = [
-    # gry
+# Wspólne wykluczenia (nigdy nie chcemy)
+GAMES_EXCLUDE = [
     "gra ", "gry ", " gra", " gry", "płyta", "plyta", "płytka", "edycja gry",
     "kolekcjonerska", "kolekcjonerskie", "remastered", "deluxe edition",
     "callisto", "fifa", "ea sports", "spider-man", "spider man", "horizon",
     "god of war", "elden ring", "diablo", "cyberpunk", "minecraft",
-    # akcesoria
+]
+OLDER_PS_EXCLUDE = [
+    "ps4", "ps 4", "playstation 4", "play station 4",
+    "ps3", "ps 3", "playstation 3",
+    "ps2", "ps 2", "playstation 2",
+    "xbox", "switch", "nintendo",
+]
+
+CONSOLE_EXCLUDE = GAMES_EXCLUDE + OLDER_PS_EXCLUDE + [
     "pad ", "pady", "kontroler", "dualsense", "dual sense",
     "etui", "pokrowiec", "case ", "futerał", "naklejk", "skin ", "skiny",
     "stojak", "podstawka", "uchwyt", "ładowarka", "ladowarka", "stacja ładująca",
@@ -50,17 +66,12 @@ EXCLUDE_KEYWORDS = [
     "dysk ssd", "ssd ", "rozszerzenie pamięci", "rozszerzenie pamieci",
     "wentylator", "chłodzenie", "chlodzenie", "cooler",
     "kierownica", "wheel", "thrustmaster", "logitech g29", "g920", "g923",
-    # nie ten model
     "remote play", "psportal", "ps portal", "ps_portal",
     "ps5 portal", "playstation portal", "konsola przenośna", "konsola przenosna",
     "cfi-y", "cfi y10",
-    "ps4", "ps 4", "playstation 4", "play station 4",
-    "ps3", "ps 3", "playstation 3",
-    "ps2", "ps 2", "playstation 2",
 ]
 
-# Słowa potwierdzające że to konsola
-CONSOLE_KEYWORDS = [
+CONSOLE_INCLUDE = [
     "konsola", "konsole", "konsoli",
     "playstation 5", "play station 5",
     "ps5 slim", "ps5 pro", "ps5 digital", "ps5 z napędem", "ps5 z napedem",
@@ -68,14 +79,115 @@ CONSOLE_KEYWORDS = [
     "sony ps5", "sony ps 5",
 ]
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-EMAIL_USER = os.environ.get("EMAIL_USER", "")
-EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
-EMAIL_TO = os.environ.get("EMAIL_TO", "")
+CONTROLLER_EXCLUDE = GAMES_EXCLUDE + [
+    "ps4", "ps 4", "playstation 4", "play station 4",
+    "ps3", "ps 3", "playstation 3",
+    "xbox", "switch", "nintendo",
+    "ładowarka", "ladowarka", "stacja ładująca", "stacja ladujaca",
+    "ładowanie", "ladowanie", "docking", "dock ",
+    "etui", "pokrowiec", "skin ", "skiny", "naklejk", "futerał",
+    "case ", "case do", "case dla", "uchwyt",
+    "wymiana", "części", "czesci", "membrana", "zamiennik",
+    "joystick zamiast", "naprawa", "do naprawy",
+    "uszkodzony", "niesprawny", "popsuty", "do remontu",
+    "kabel", "przewód", "przewod", "hdmi",
+    "konsola", "konsole", "konsoli",  # nie chcemy konsoli w torze padów
+    "słuchawki", "sluchawki", "headset",
+    "klawiatura", "mysz", "myszka",
+    "gra ", "gry ",
+]
 
-all_offers = []
+CONTROLLER_INCLUDE = [
+    "dualsense", "dual sense",
+    "pad ps5", "pad do ps5", "pad ps 5", "pad do ps 5",
+    "kontroler ps5", "kontroler do ps5", "kontroler ps 5",
+    "pad playstation 5", "kontroler playstation 5",
+    "pad sony ps5", "dualsense edge",
+]
 
+
+def is_ps5_console(title: str) -> bool:
+    if not title:
+        return False
+    t = " " + title.lower() + " "
+    for kw in CONSOLE_EXCLUDE:
+        if kw in t:
+            return False
+    if any(kw in t for kw in CONSOLE_INCLUDE):
+        return True
+    # Fallback: tytuł ma „ps5/ps 5" + słowo sugerujące konsolę
+    if not re.search(r"\bps\s?5\b|\bplaystation\s?5\b", t):
+        return False
+    hints = ["sprzedam ps", "ps5 +", "ps 5 +", "ps5 plus", "ps 5 plus",
+             "z padem", "z padami", "z grami", "zestaw ps", "komplet ps",
+             "ps5 825", "ps5 1tb", "ps 5 825", "ps 5 1tb",
+             "ps5 nowa", "ps5 nowy", "ps 5 nowa", "ps 5 nowy",
+             "ps5 używan", "ps5 uzywan", "ps 5 używan", "ps 5 uzywan"]
+    return any(h in t for h in hints)
+
+
+def is_ps5_controller(title: str) -> bool:
+    if not title:
+        return False
+    t = " " + title.lower() + " "
+    for kw in CONTROLLER_EXCLUDE:
+        if kw in t:
+            return False
+    return any(kw in t for kw in CONTROLLER_INCLUDE)
+
+
+def detect_console_variant(title: str) -> tuple[str, float]:
+    t = title.lower()
+    if "pro" in t and "ps" in t:
+        return ("Pro", NEW_PRICE_PRO)
+    if "digital" in t or "cyfrow" in t:
+        return ("Digital", NEW_PRICE_DIGITAL)
+    if "slim" in t:
+        return ("Slim z napędem", NEW_PRICE_SLIM_DISC)
+    if "z napęd" in t or "z naped" in t or "blu-ray" in t or "blu ray" in t:
+        return ("Z napędem", NEW_PRICE_SLIM_DISC)
+    return ("Standard (?)", NEW_PRICE_SLIM_DISC)
+
+
+def detect_controller_variant(title: str) -> tuple[str, float]:
+    t = title.lower()
+    if "edge" in t:
+        return ("DualSense Edge", NEW_PRICE_DUALSENSE_EDGE)
+    return ("DualSense", NEW_PRICE_DUALSENSE)
+
+
+CATEGORIES = {
+    "console": {
+        "label": "Konsola PS5",
+        "emoji": "🎮",
+        "query": "ps5",
+        "min_price": 500,
+        "max_price": 2000,
+        "filter": is_ps5_console,
+        "variant_fn": detect_console_variant,
+        "new_prices": {
+            "Digital": NEW_PRICE_DIGITAL,
+            "Slim z napędem": NEW_PRICE_SLIM_DISC,
+            "Pro": NEW_PRICE_PRO,
+        },
+    },
+    "controller": {
+        "label": "Pad DualSense",
+        "emoji": "🕹️",
+        "query": "dualsense",
+        "min_price": 80,
+        "max_price": 350,
+        "filter": is_ps5_controller,
+        "variant_fn": detect_controller_variant,
+        "new_prices": {
+            "DualSense": NEW_PRICE_DUALSENSE,
+            "DualSense Edge": NEW_PRICE_DUALSENSE_EDGE,
+        },
+    },
+}
+
+
+# ============== HELPERS ==============
 
 def parse_price(text: str) -> float | None:
     if not text:
@@ -90,57 +202,284 @@ def parse_price(text: str) -> float | None:
 
 
 def is_shipping_available(item_text: str) -> bool:
-    keywords = ["wysył", "przesył", "dostaw", "kurier", "paczka", "paczkomat", "ship"]
-    return any(k in item_text.lower() for k in keywords)
+    kws = ["wysył", "przesył", "dostaw", "kurier", "paczka", "paczkomat", "ship"]
+    return any(k in item_text.lower() for k in kws)
 
 
-def is_ps5_console(title: str) -> bool:
-    """Return True jeśli tytuł oferty wygląda na konsolę PS5, nie grę/akcesorium."""
-    if not title:
-        return False
-    t = " " + title.lower() + " "
-
-    for kw in EXCLUDE_KEYWORDS:
-        if kw in t:
-            return False
-
-    if any(kw in t for kw in CONSOLE_KEYWORDS):
-        return True
-
-    # Fallback: tytuł zawiera ps5/ps 5 i słowa typu "sprzedam/komplet/zestaw" — pewnie konsola
-    has_ps5 = re.search(r"\bps\s?5\b|\bplaystation\s?5\b", t) is not None
-    if not has_ps5:
-        return False
-
-    console_hints = ["sprzedam ps", "ps5 +", "ps 5 +", "ps5 plus", "ps 5 plus",
-                     "z padem", "z padami", "z grami", "zestaw ps", "komplet ps",
-                     "ps5 825", "ps5 1tb", "ps 5 825", "ps 5 1tb",
-                     "ps5 nowa", "ps5 nowy", "ps 5 nowa", "ps 5 nowy",
-                     "ps5 używan", "ps5 uzywan", "ps 5 używan", "ps 5 uzywan"]
-    return any(h in t for h in console_hints)
+def deduplicate(offers: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+    for o in offers:
+        key = (o.get("category", ""), o.get("title", "").lower().strip(), round(o.get("price", 0)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(o)
+    return unique
 
 
-def detect_variant(title: str) -> tuple[str, float]:
-    """Wykryj wariant PS5 i zwróć (etykietę, cenę nowego sprzętu w PLN)."""
-    t = title.lower()
-    if "pro" in t and "ps" in t:
-        return ("Pro", NEW_PRICE_PRO)
-    if "digital" in t or "cyfrow" in t:
-        return ("Digital", NEW_PRICE_DIGITAL)
-    if "slim" in t:
-        return ("Slim z napędem", NEW_PRICE_SLIM_DISC)
-    if "z napęd" in t or "z naped" in t or "blu-ray" in t or "blu ray" in t:
-        return ("Z napędem", NEW_PRICE_SLIM_DISC)
-    return ("Standard (?)", NEW_PRICE_SLIM_DISC)
+# ============== SCRAPERS ==============
+
+async def scrape_olx(page, cat: dict) -> list[dict]:
+    offers = []
+    seen_ids = set()
+    query = cat["query"]
+    for page_num in range(1, OLX_MAX_PAGES + 1):
+        url = (f"https://www.olx.pl/oferty/q-{query}/"
+               if page_num == 1 else
+               f"https://www.olx.pl/oferty/q-{query}/?page={page_num}")
+        print(f"[OLX/{cat['label']}] page {page_num}")
+        try:
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+            soup = BeautifulSoup(await page.content(), "lxml")
+            items = soup.select("[data-cy='l-card']") or soup.select("div[class*='offer'], article")
+            page_added = 0
+            for item in items:
+                offer_id = item.get("id") or ""
+                if offer_id and offer_id in seen_ids:
+                    continue
+                title_el = item.select_one("h4, h6, a[class*='title']")
+                price_el = item.select_one("[data-testid='ad-price'], p[class*='price'], span[class*='price']")
+                link_el = item.select_one("a[href*='/d/oferta'], a[href*='/oferta']")
+                title = title_el.get_text(strip=True) if title_el else ""
+                price = parse_price(price_el.get_text(strip=True) if price_el else "")
+                href = link_el.get("href", "") if link_el else ""
+                link = "https://www.olx.pl" + href if href.startswith("/") else href
+
+                if not (title and price and cat["min_price"] <= price <= cat["max_price"]):
+                    continue
+                if not cat["filter"](title):
+                    continue
+                if offer_id:
+                    seen_ids.add(offer_id)
+                offers.append({
+                    "category": cat["label"], "source": "OLX",
+                    "title": title[:200], "price": price, "currency": "PLN",
+                    "url": link, "shipping": is_shipping_available(item.get_text(" ", strip=True)),
+                    "timestamp": datetime.now().isoformat(),
+                })
+                page_added += 1
+            print(f"[OLX/{cat['label']}] page {page_num}: +{page_added} (total {len(offers)})")
+            if not items:
+                break
+        except Exception as e:
+            print(f"[OLX/{cat['label']}] page {page_num} error: {e}")
+            break
+    return offers
 
 
-def analyze_offer(offer: dict, median_price: float) -> dict:
-    """Dodaj do oferty pola: variant, new_price, vs_median, vs_new, verdict, negotiation."""
-    variant, new_price = detect_variant(offer["title"])
+async def scrape_allegro(page, cat: dict) -> list[dict]:
+    offers = []
+    url = f"https://allegro.pl/listing?string={cat['query']}&order=m"
+    print(f"[Allegro/{cat['label']}] {url}")
+    try:
+        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        soup = BeautifulSoup(await page.content(), "lxml")
+        items = (soup.select("[data-box-type='offer'], article[class*='offer']")
+                 or soup.select("div[class*='mpof_']"))
+        for item in items:
+            title_el = item.select_one("a[class*='title'], h2 a")
+            price_el = item.select_one("[class*='price']")
+            title = title_el.get_text(strip=True) if title_el else ""
+            price = parse_price(price_el.get_text(strip=True) if price_el else "")
+            link = title_el["href"] if title_el and title_el.get("href") else ""
+            if link.startswith("/"):
+                link = "https://allegro.pl" + link
+            if title and price and cat["min_price"] <= price <= cat["max_price"] and cat["filter"](title):
+                offers.append({
+                    "category": cat["label"], "source": "Allegro",
+                    "title": title[:200], "price": price, "currency": "PLN",
+                    "url": link, "shipping": None,
+                    "timestamp": datetime.now().isoformat(),
+                })
+    except Exception as e:
+        print(f"[Allegro/{cat['label']}] error: {e}")
+    return offers
+
+
+async def scrape_allegro_lokalnie(page, cat: dict) -> list[dict]:
+    offers = []
+    url = f"https://allegrolokalnie.pl/oferty/q/{cat['query']}"
+    print(f"[ALok/{cat['label']}] {url}")
+    try:
+        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        soup = BeautifulSoup(await page.content(), "lxml")
+        items = soup.select("article.mlc-itembox__container") or soup.select("article[class*='itembox']")
+        for item in items:
+            link_el = item.select_one("a[href*='/oferta/']")
+            title = link_el.get_text(" ", strip=True).split("Kup teraz")[0].strip() if link_el else ""
+            price_el = item.select_one(".mlc-itembox__price, .ml-offer-price")
+            price = parse_price(price_el.get_text(" ", strip=True) if price_el else "")
+            link = link_el["href"] if link_el and link_el.get("href") else ""
+            if link and not link.startswith("http"):
+                link = "https://allegrolokalnie.pl" + link
+            if title and price and cat["min_price"] <= price <= cat["max_price"] and cat["filter"](title):
+                offers.append({
+                    "category": cat["label"], "source": "AllegroLokalnie",
+                    "title": title[:200], "price": price, "currency": "PLN",
+                    "url": link, "shipping": is_shipping_available(item.get_text(" ", strip=True)),
+                    "timestamp": datetime.now().isoformat(),
+                })
+    except Exception as e:
+        print(f"[ALok/{cat['label']}] error: {e}")
+    return offers
+
+
+def scrape_pepper(cat: dict) -> list[dict]:
+    offers = []
+    url = f"https://www.pepper.pl/search?q={cat['query']}"
+    print(f"[Pepper/{cat['label']}] {url}")
+    try:
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+        resp = requests.get(url, headers={"User-Agent": ua}, timeout=15)
+        if resp.status_code != 200:
+            print(f"[Pepper/{cat['label']}] HTTP {resp.status_code}")
+            return offers
+        soup = BeautifulSoup(resp.text, "lxml")
+        items = soup.select("article.thread")
+        price_re = re.compile(r"(\d{2,4}(?:[,.]\d{1,2})?)\s*zł", re.IGNORECASE)
+        for item in items:
+            title_el = item.select_one("a.thread-title, a.cept-tt, a.thread-link")
+            title = title_el.get_text(strip=True) if title_el else ""
+            price_el = item.select_one("span.thread-price")
+            price = parse_price(price_el.get_text(strip=True) if price_el else "")
+            if price is None:
+                cands = [parse_price(m) for m in price_re.findall(item.get_text(" ", strip=True))]
+                cands = [c for c in cands if c and cat["min_price"] <= c <= cat["max_price"]]
+                price = cands[0] if cands else None
+            link = title_el["href"] if title_el and title_el.get("href") else ""
+            if link and not link.startswith("http"):
+                link = "https://www.pepper.pl" + link
+            if title and price and cat["min_price"] <= price <= cat["max_price"] and cat["filter"](title):
+                offers.append({
+                    "category": cat["label"], "source": "Pepper",
+                    "title": title[:200], "price": price, "currency": "PLN",
+                    "url": link, "shipping": None,
+                    "timestamp": datetime.now().isoformat(),
+                })
+    except Exception as e:
+        print(f"[Pepper/{cat['label']}] error: {e}")
+    return offers
+
+
+# ============== DETAIL FETCH ==============
+
+async def fetch_description(page, source: str, url: str) -> str:
+    """Wejdź na stronę oferty, wyciągnij opis. Zwróć '' przy błędzie."""
+    if not url:
+        return ""
+    try:
+        await page.goto(url, timeout=DETAIL_FETCH_TIMEOUT, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        html = await page.content()
+        soup = BeautifulSoup(html, "lxml")
+        if source == "OLX":
+            el = (soup.select_one("[data-cy='ad_description']")
+                  or soup.select_one("div[data-testid='ad-description']")
+                  or soup.select_one(".css-1t507yq"))
+        elif source == "AllegroLokalnie":
+            el = (soup.select_one(".offer-description")
+                  or soup.select_one("[class*='description']")
+                  or soup.select_one("section[class*='desc']"))
+        elif source == "Allegro":
+            el = (soup.select_one("[data-box-name='description']")
+                  or soup.select_one("[class*='description']"))
+        else:
+            el = soup.select_one("[class*='description'], [class*='thread-body']")
+        if not el:
+            return ""
+        text = el.get_text(" ", strip=True)
+        return text[:3000]  # limit dla Gemini
+    except Exception as e:
+        print(f"[detail] {source} {url[:60]} error: {e}")
+        return ""
+
+
+# ============== GEMINI ==============
+
+GEMINI_PROMPT = """Jesteś ekspertem od kupowania PS5 i akcesoriów z drugiej ręki w Polsce.
+Pomóż użytkownikowi wynegocjować NIŻSZĄ cenę.
+
+Oferta:
+- Tytuł: {title}
+- Cena wystawiona: {price} zł
+- Wariant: {variant}
+- Cena nowego sprzętu w sklepie: {new_price} zł
+- Mediana rynku wtórnego (z dzisiejszych ogłoszeń): {median_price} zł
+- Źródło: {source}
+- Pełny opis oferty:
+\"\"\"
+{description}
+\"\"\"
+
+Twoje zadanie — odpowiedz JSON-em (bez markdownu, bez ```json```, tylko surowy JSON) z polami:
+{{
+  "red_flags": ["lista krótkich obserwacji wartych wykorzystania w negocjacji - np. brak gwarancji, używana >X miesięcy, rysy, brak pudełka, sprzedawany 'bez powodu' co sugeruje wadę, drift na padzie, bateria słabnie, kabel innej marki, niejasne ślady używania, mało zdjęć, oferent unika opisu stanu, przesada w komplecie itd. - max 5"],
+  "recommended_offer": liczba_PLN_jaką_zaproponować,
+  "negotiation_message": "Gotowa wiadomość do wysłania sprzedającemu - po polsku, uprzejma, ale konkretnie wykorzystująca red flags i argumenty cenowe. Krótko (3-5 zdań). Bez 'Pan/Pani' jeśli to ogłoszenie OLX (tam się tyka). Zaproponuj konkretną cenę. Nie podawaj swoich danych. Brzmij naturalnie, nie jak bot.",
+  "verdict_short": "jedno zdanie podsumowania czy w ogóle warto"
+}}
+
+Jeśli opis jest pusty/krótki - opieraj się tylko na tytule i statystykach rynku.
+"""
+
+
+def gemini_call(prompt: str) -> dict | None:
+    if not GEMINI_API_KEY:
+        return None
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.6,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code != 200:
+            print(f"[Gemini] HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        # czasem mimo responseMimeType=json mogą być fence-y
+        text = text.strip().lstrip("`").lstrip("json").strip()
+        if text.endswith("```"):
+            text = text.rstrip("`").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[Gemini] exception: {e}")
+        return None
+
+
+def gemini_analyze_offer(offer: dict, median_price: float) -> dict:
+    prompt = GEMINI_PROMPT.format(
+        title=offer["title"],
+        price=int(offer["price"]),
+        variant=offer.get("variant", "?"),
+        new_price=int(offer.get("new_price", 0)),
+        median_price=int(median_price),
+        source=offer["source"],
+        description=offer.get("description", "") or "(brak opisu)",
+    )
+    result = gemini_call(prompt)
+    if not result:
+        return {"red_flags": [], "recommended_offer": None,
+                "negotiation_message": "(Gemini niedostępny)", "verdict_short": ""}
+    return result
+
+
+# ============== PRICE ANALYSIS ==============
+
+def attach_market_analysis(offer: dict, median_price: float, variant_fn) -> dict:
+    variant, new_price = variant_fn(offer["title"])
     price = offer["price"]
-    vs_median = (price - median_price) / median_price * 100  # %
-    vs_new = (price - new_price) / new_price * 100  # % (ujemne = taniej niż nowa)
-
+    vs_median = (price - median_price) / median_price * 100
+    vs_new = (price - new_price) / new_price * 100
     if vs_median <= -20:
         verdict = "🟢 ŚWIETNA OKAZJA"
     elif vs_median <= -8:
@@ -151,444 +490,267 @@ def analyze_offer(offer: dict, median_price: float) -> dict:
         verdict = "🟠 Drogo"
     else:
         verdict = "🔴 Bardzo drogo"
-
-    # Pole do targowania = im wyżej powyżej mediany, tym większa szansa
-    if vs_median > 15:
-        negotiation = "wysoka (cena znacznie powyżej mediany)"
-    elif vs_median > 5:
-        negotiation = "średnia (cena powyżej mediany)"
-    elif vs_median > -5:
-        negotiation = "niska (cena ok mediany)"
-    else:
-        negotiation = "niska (już taniej niż średnio)"
-
     offer["variant"] = variant
     offer["new_price"] = new_price
     offer["vs_median_pct"] = round(vs_median, 1)
     offer["vs_new_pct"] = round(vs_new, 1)
     offer["verdict"] = verdict
-    offer["negotiation"] = negotiation
     return offer
 
 
-def deduplicate(offers: list[dict]) -> list[dict]:
-    seen = set()
-    unique = []
-    for o in offers:
-        key = (o.get("title", ""), o.get("price", 0))
-        if key not in seen:
-            seen.add(key)
-            unique.append(o)
-    return unique
+# ============== STORAGE ==============
 
-
-async def scrape_olx(page) -> list[dict]:
-    offers = []
-    seen_ids = set()
-    for page_num in range(1, OLX_MAX_PAGES + 1):
-        url = (f"https://www.olx.pl/oferty/q-{QUERY}/"
-               if page_num == 1 else
-               f"https://www.olx.pl/oferty/q-{QUERY}/?page={page_num}")
-        print(f"[OLX] Scraping page {page_num}: {url}")
-        try:
-            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2500)
-            content = await page.content()
-            soup = BeautifulSoup(content, "lxml")
-
-            items = soup.select("[data-cy='l-card']")
-            if not items:
-                items = soup.select("div[class*='offer'], article")
-
-            page_added = 0
-            for item in items:
-                offer_id = item.get("id") or ""
-                if offer_id and offer_id in seen_ids:
-                    continue
-
-                title_el = item.select_one("h4, h6, a[class*='title']")
-                price_el = item.select_one("[data-testid='ad-price'], p[class*='price'], span[class*='price']")
-                link_el = item.select_one("a[href*='/d/oferta'], a[href*='/oferta']")
-
-                title = title_el.get_text(strip=True) if title_el else ""
-                price_text = price_el.get_text(strip=True) if price_el else ""
-                price = parse_price(price_text)
-                href = link_el.get("href", "") if link_el else ""
-                link = "https://www.olx.pl" + href if href.startswith("/") else href
-
-                item_text_full = item.get_text(" ", strip=True).lower()
-                shipping = is_shipping_available(item_text_full)
-
-                if not (title and price and MIN_PRICE <= price <= MAX_PRICE):
-                    continue
-                if not is_ps5_console(title):
-                    continue
-
-                if offer_id:
-                    seen_ids.add(offer_id)
-                offers.append({
-                    "source": "OLX",
-                    "title": title[:200],
-                    "price": price,
-                    "currency": "PLN",
-                    "url": link,
-                    "shipping": shipping,
-                    "timestamp": datetime.now().isoformat(),
-                })
-                page_added += 1
-
-            print(f"[OLX] page {page_num}: +{page_added} offers (total {len(offers)})")
-            # Jeśli na całej stronie nie znaleźliśmy ani jednej karty → koniec paginacji
-            if not items:
-                break
-        except Exception as e:
-            print(f"[OLX] page {page_num} error: {e}")
-            break
-    print(f"[OLX] Found {len(offers)} console offers")
-    return offers
-
-
-async def scrape_allegro(page) -> list[dict]:
-    offers = []
-    url = f"https://allegro.pl/listing?string={QUERY}&order=m"
-    print(f"[Allegro] Scraping {url}")
-    try:
-        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-
-        content = await page.content()
-        soup = BeautifulSoup(content, "lxml")
-
-        items = soup.select("[data-box-type='offer'], article[class*='offer'], div[class*='offer']")
-        if not items:
-            items = soup.select("div[class*='mpof_']")
-
-        for item in items:
-            title_el = item.select_one("a[class*='title'], h2 a, a[class*='_w7z6o']")
-            price_el = item.select_one("[class*='price'], span[class*='_1svub'], span[class*='_w7z6o']")
-            link_el = title_el if title_el else item.select_one("a[href*='/oferta']")
-
-            title = title_el.get_text(strip=True) if title_el else ""
-            price_text = price_el.get_text(strip=True) if price_el else ""
-            price = parse_price(price_text)
-            link = link_el["href"] if link_el and link_el.get("href") else ""
-            if link and link.startswith("/"):
-                link = "https://allegro.pl" + link
-
-            if title and price and MIN_PRICE <= price <= MAX_PRICE and is_ps5_console(title):
-                offers.append({
-                    "source": "Allegro",
-                    "title": title[:200],
-                    "price": price,
-                    "currency": "PLN",
-                    "url": link,
-                    "shipping": None,
-                    "timestamp": datetime.now().isoformat(),
-                })
-    except Exception as e:
-        print(f"[Allegro] Error: {e}")
-    print(f"[Allegro] Found {len(offers)} offers")
-    return offers
-
-
-async def scrape_allegro_lokalnie(page) -> list[dict]:
-    offers = []
-    url = f"https://allegrolokalnie.pl/oferty/q/{QUERY}"
-    print(f"[Allegro Lokalnie] Scraping {url}")
-    try:
-        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        content = await page.content()
-        soup = BeautifulSoup(content, "lxml")
-
-        items = soup.select("article.mlc-itembox__container")
-        if not items:
-            items = soup.select("article[class*='itembox'], article[class*='offer']")
-
-        for item in items:
-            link_el = item.select_one("a[href*='/oferta/']")
-            title = link_el.get_text(" ", strip=True).split("Kup teraz")[0].strip() if link_el else ""
-            price_el = item.select_one(".mlc-itembox__price, .ml-offer-price")
-            price_text = price_el.get_text(" ", strip=True) if price_el else ""
-            price = parse_price(price_text)
-            link = link_el["href"] if link_el and link_el.get("href") else ""
-            if link and not link.startswith("http"):
-                link = "https://allegrolokalnie.pl" + link
-
-            full_text = item.get_text(" ", strip=True).lower()
-            shipping = is_shipping_available(full_text)
-
-            if title and price and MIN_PRICE <= price <= MAX_PRICE and is_ps5_console(title):
-                offers.append({
-                    "source": "AllegroLokalnie",
-                    "title": title[:200],
-                    "price": price,
-                    "currency": "PLN",
-                    "url": link,
-                    "shipping": shipping,
-                    "timestamp": datetime.now().isoformat(),
-                })
-    except Exception as e:
-        print(f"[Allegro Lokalnie] Error: {e}")
-    print(f"[Allegro Lokalnie] Found {len(offers)} offers")
-    return offers
-
-
-def scrape_pepper() -> list[dict]:
-    offers = []
-    url = f"https://www.pepper.pl/search?q={QUERY}"
-    print(f"[Pepper] Scraping {url}")
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            print(f"[Pepper] HTTP {resp.status_code}")
-            return offers
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        items = soup.select("article.thread")
-        if not items:
-            items = soup.select("article[class*='thread'], div[class*='thread']")
-
-        price_re = re.compile(r"(\d{2,4}(?:[,.]\d{1,2})?)\s*zł", re.IGNORECASE)
-
-        for item in items:
-            title_el = item.select_one("a.thread-title, a.cept-tt, a.thread-link")
-            link_el = title_el
-            title = title_el.get_text(strip=True) if title_el else ""
-
-            price_el = item.select_one("span.thread-price, span[class*='thread-price']")
-            price_text = price_el.get_text(strip=True) if price_el else ""
-            price = parse_price(price_text)
-
-            if price is None:
-                full_text = item.get_text(" ", strip=True)
-                matches = price_re.findall(full_text)
-                candidates = [parse_price(m) for m in matches]
-                candidates = [c for c in candidates if c and MIN_PRICE <= c <= MAX_PRICE]
-                price = candidates[0] if candidates else None
-
-            link = link_el["href"] if link_el and link_el.get("href") else ""
-            if link and not link.startswith("http"):
-                link = "https://www.pepper.pl" + link
-
-            if title and price and MIN_PRICE <= price <= MAX_PRICE and is_ps5_console(title):
-                offers.append({
-                    "source": "Pepper",
-                    "title": title[:200],
-                    "price": price,
-                    "currency": "PLN",
-                    "url": link,
-                    "shipping": None,
-                    "timestamp": datetime.now().isoformat(),
-                })
-    except Exception as e:
-        print(f"[Pepper] Error: {e}")
-    print(f"[Pepper] Found {len(offers)} offers")
-    return offers
-
-
-def save_results(offers: list[dict]):
-    if not offers:
-        print("[Save] No offers to save")
-        return
-
-    df = pd.DataFrame(offers)
+def save_results(all_offers: list[dict]):
+    if not all_offers:
+        print("[Save] nothing to save")
+        return None
+    df = pd.DataFrame(all_offers)
     csv_path = RESULTS_DIR / "ps5_offers_latest.csv"
     xlsx_path = RESULTS_DIR / f"ps5_offers_{datetime.now().strftime('%Y%m%d')}.xlsx"
-
     df.to_csv(csv_path, index=False, encoding="utf-8")
-    print(f"[Save] CSV saved: {csv_path} ({len(df)} rows)")
-
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="PS5 Offers")
-    print(f"[Save] XLSX saved: {xlsx_path}")
-
-    summary_path = RESULTS_DIR / "summary.json"
+        df.to_excel(writer, index=False, sheet_name="Offers")
     summary = {
         "scan_timestamp": datetime.now().isoformat(),
-        "total_offers": len(offers),
-        "min_price": float(df["price"].min()),
-        "max_price": float(df["price"].max()),
-        "avg_price": round(float(df["price"].mean()), 2),
+        "total_offers": len(all_offers),
+        "by_category": df["category"].value_counts().to_dict(),
         "by_source": df["source"].value_counts().to_dict(),
     }
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    print(f"[Save] Summary saved: {summary_path}")
-
+    (RESULTS_DIR / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"[Save] {csv_path} ({len(df)} rows), {xlsx_path}, summary.json")
     return df
 
 
+# ============== TELEGRAM ==============
+
 def tg_escape(s: str) -> str:
-    """Escape dla MarkdownV2 (Telegram)."""
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", s)
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(s))
 
 
 def send_tg_message(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "MarkdownV2",
-        "disable_web_page_preview": True,
-    }
+    # Telegram limit: 4096 chars per message
+    if len(text) > 4000:
+        text = text[:4000] + "…"
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID, "text": text,
+            "parse_mode": "MarkdownV2", "disable_web_page_preview": True,
+        }, timeout=15)
+        if r.status_code == 200:
             return True
-        print(f"[Telegram] Error: {resp.status_code} {resp.text[:300]}")
+        print(f"[Telegram] {r.status_code}: {r.text[:300]}")
     except Exception as e:
-        print(f"[Telegram] Exception: {e}")
+        print(f"[Telegram] exc: {e}")
     return False
 
 
-def send_telegram(df: pd.DataFrame):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram] Skipping - no token or chat ID")
+def fmt_pct(v: float) -> str:
+    if v > 0:
+        return f"\\+{v:.0f}%"
+    return f"{v:.0f}%".replace("-", "\\-")
+
+
+def send_category_telegram(cat_label: str, cat_emoji: str, df_cat: pd.DataFrame, new_prices: dict):
+    if df_cat.empty:
         return
+    pmin, pmax, pmed, pavg = df_cat["price"].min(), df_cat["price"].max(), df_cat["price"].median(), df_cat["price"].mean()
+    by_src = df_cat["source"].value_counts().to_dict()
 
-    count = len(df)
-    by_source = df["source"].value_counts().to_dict()
-    price_min = df["price"].min()
-    price_max = df["price"].max()
-    price_median = df["price"].median()
-    price_avg = df["price"].mean()
-
+    new_lines = "\n".join(f"  • {k}: {v} zł" for k, v in new_prices.items())
     header = (
-        f"🎮 *PS5 Monitor — {tg_escape(datetime.now().strftime('%Y-%m-%d'))}*\n"
-        f"Znaleziono *{count}* konsol w przedziale {MIN_PRICE}–{MAX_PRICE} zł\n\n"
-        f"*Źródła:* OLX: {by_source.get('OLX', 0)} \\| Allegro: {by_source.get('Allegro', 0)} \\| "
-        f"AllegroLok: {by_source.get('AllegroLokalnie', 0)} \\| Pepper: {by_source.get('Pepper', 0)}\n\n"
-        f"*Rynek wtórny \\(z dziś\\):*\n"
-        f"  • mediana: *{price_median:.0f} zł*\n"
-        f"  • średnia: {price_avg:.0f} zł\n"
-        f"  • zakres: {price_min:.0f}–{price_max:.0f} zł\n\n"
-        f"*Ceny nowych \\(orientacyjnie\\):*\n"
-        f"  • Digital: {NEW_PRICE_DIGITAL} zł\n"
-        f"  • Slim z napędem: {NEW_PRICE_SLIM_DISC} zł\n"
-        f"  • Pro: {NEW_PRICE_PRO} zł\n"
+        f"{cat_emoji} *{tg_escape(cat_label)} — {tg_escape(datetime.now().strftime('%Y-%m-%d'))}*\n"
+        f"Znaleziono *{len(df_cat)}* ofert\n\n"
+        f"*Źródła:* " + " \\| ".join(f"{tg_escape(s)}: {n}" for s, n in by_src.items()) + "\n\n"
+        f"*Rynek wtórny \\(dziś\\):*\n"
+        f"  • mediana: *{pmed:.0f} zł*\n"
+        f"  • średnia: {pavg:.0f} zł\n"
+        f"  • zakres: {pmin:.0f}–{pmax:.0f} zł\n\n"
+        f"*Ceny nowych \\(orientacyjnie\\):*\n{tg_escape(new_lines).replace(chr(92)+chr(92)+'.', '.').replace(chr(92)+'.', '.')}\n"
+    )
+    # tg_escape already escaped \n inside new_lines, fix manually
+    new_lines_esc = "\n".join(f"  • {tg_escape(k)}: {v} zł" for k, v in new_prices.items())
+    header = (
+        f"{cat_emoji} *{tg_escape(cat_label)} — {tg_escape(datetime.now().strftime('%Y-%m-%d'))}*\n"
+        f"Znaleziono *{len(df_cat)}* ofert\n\n"
+        f"*Źródła:* " + " \\| ".join(f"{tg_escape(s)}: {n}" for s, n in by_src.items()) + "\n\n"
+        f"*Rynek wtórny \\(dziś\\):*\n"
+        f"  • mediana: *{pmed:.0f} zł*\n"
+        f"  • średnia: {pavg:.0f} zł\n"
+        f"  • zakres: {pmin:.0f}–{pmax:.0f} zł\n\n"
+        f"*Ceny nowych \\(orientacyjnie\\):*\n{new_lines_esc}\n"
     )
     send_tg_message(header)
 
-    # TOP oferty wg verdyktu — sortuj rosnąco po vs_median_pct (najlepsza okazja na górze)
-    top = df.sort_values("vs_median_pct").head(15)
-
-    for _, row in top.iterrows():
-        title = tg_escape(str(row["title"])[:100])
-        url = str(row["url"]) or ""
-        link_part = f"[link]({tg_escape(url)})" if url else "brak linku"
-
+    for _, row in df_cat.sort_values("vs_median_pct").iterrows():
+        title = tg_escape(str(row["title"])[:120])
+        url_ = str(row.get("url") or "")
+        link_part = f"[otwórz ofertę]({tg_escape(url_)})" if url_ else "brak linku"
         vs_med = row["vs_median_pct"]
         vs_new = row["vs_new_pct"]
-        vs_med_str = f"\\+{vs_med:.0f}%" if vs_med > 0 else f"{vs_med:.0f}%".replace("-", "\\-")
-        vs_new_str = f"\\+{vs_new:.0f}%" if vs_new > 0 else f"{vs_new:.0f}%".replace("-", "\\-")
 
         msg = (
             f"{tg_escape(row['verdict'])}  *{row['price']:.0f} zł*\n"
             f"_{title}_\n"
-            f"Wariant: {tg_escape(str(row['variant']))} \\| {row['source']} \\| {link_part}\n"
-            f"vs mediana rynku: {vs_med_str} \\| vs cena nowej: {vs_new_str}\n"
-            f"💬 Pole do targowania: {tg_escape(str(row['negotiation']))}\n"
+            f"Wariant: {tg_escape(row['variant'])} \\| {tg_escape(row['source'])} \\| {link_part}\n"
+            f"vs mediana: {fmt_pct(vs_med)} \\| vs cena nowej: {fmt_pct(vs_new)}\n"
         )
+
+        red_flags = row.get("red_flags") or []
+        if isinstance(red_flags, str):
+            try:
+                red_flags = json.loads(red_flags)
+            except Exception:
+                red_flags = []
+        if red_flags:
+            msg += "\n🚩 *Argumenty do negocjacji:*\n"
+            for f in red_flags[:5]:
+                msg += f"  • {tg_escape(str(f))}\n"
+
+        rec = row.get("recommended_offer")
+        if rec and not pd.isna(rec):
+            try:
+                msg += f"\n💰 *Proponuj:* {int(float(rec))} zł\n"
+            except Exception:
+                pass
+
+        verdict_short = row.get("verdict_short")
+        if verdict_short and not pd.isna(verdict_short) and str(verdict_short).strip():
+            msg += f"_{tg_escape(str(verdict_short))}_\n"
+
+        neg_msg = row.get("negotiation_message")
+        if neg_msg and not pd.isna(neg_msg) and str(neg_msg).strip() and str(neg_msg) != "(Gemini niedostępny)":
+            msg += f"\n📨 *Wiadomość do skopiowania:*\n```\n{neg_msg}\n```\n"
+
         send_tg_message(msg)
 
-    print(f"[Telegram] Sent header + {len(top)} offer messages")
 
+def send_telegram_all(df: pd.DataFrame):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Telegram] skipping — no token/chat")
+        return
+    for cat_key, cat in CATEGORIES.items():
+        sub = df[df["category"] == cat["label"]]
+        send_category_telegram(cat["label"], cat["emoji"], sub, cat["new_prices"])
+    print(f"[Telegram] sent {len(df)} offers across categories")
+
+
+# ============== EMAIL ==============
 
 def send_email(df: pd.DataFrame):
-    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("[Email] Skipping - missing credentials")
+    if not (EMAIL_USER and EMAIL_PASS and EMAIL_TO):
+        print("[Email] skipping — missing creds")
         return
-
-    count = len(df)
-    median_price = df["price"].median()
-    html = f"""<html><body style="font-family:Arial;font-size:13px;">
-    <h2>🎮 PS5 Monitor – {datetime.now().strftime('%Y-%m-%d')}</h2>
-    <p>Znaleziono <b>{count}</b> konsol PS5 w przedziale {MIN_PRICE}–{MAX_PRICE} zł.</p>
-    <p><b>Rynek wtórny dziś:</b> mediana {median_price:.0f} zł, średnia {df['price'].mean():.0f} zł, zakres {df['price'].min():.0f}–{df['price'].max():.0f} zł.<br>
-    <b>Ceny nowych:</b> Digital {NEW_PRICE_DIGITAL} zł · Slim z napędem {NEW_PRICE_SLIM_DISC} zł · Pro {NEW_PRICE_PRO} zł.</p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
-    <tr style="background:#f0f0f0;"><th>Werdykt</th><th>Cena</th><th>Wariant</th><th>vs mediana</th><th>vs nowa</th><th>Źródło</th><th>Tytuł</th><th>Targowanie</th><th>Link</th></tr>
-    """
-    for _, row in df.sort_values("vs_median_pct").head(30).iterrows():
-        url = row["url"] or "#"
-        html += (f"<tr><td>{row['verdict']}</td><td><b>{row['price']:.0f} zł</b></td>"
-                 f"<td>{row['variant']}</td>"
-                 f"<td>{row['vs_median_pct']:+.0f}%</td>"
-                 f"<td>{row['vs_new_pct']:+.0f}%</td>"
-                 f"<td>{row['source']}</td>"
-                 f"<td>{row['title'][:80]}</td>"
-                 f"<td>{row['negotiation']}</td>"
-                 f'<td><a href="{url}">otwórz</a></td></tr>')
-    html += "</table></body></html>"
+    html_parts = [f"<html><body style='font-family:Arial;font-size:13px;'>",
+                  f"<h2>🎮 PS5 Monitor – {datetime.now().strftime('%Y-%m-%d')}</h2>"]
+    for cat_key, cat in CATEGORIES.items():
+        sub = df[df["category"] == cat["label"]]
+        if sub.empty:
+            continue
+        html_parts.append(f"<h3>{cat['emoji']} {cat['label']} — {len(sub)} ofert (mediana {sub['price'].median():.0f} zł)</h3>")
+        html_parts.append("<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;'>")
+        html_parts.append("<tr style='background:#f0f0f0;'><th>Werdykt</th><th>Cena</th><th>Wariant</th><th>vs mediana</th><th>vs nowa</th><th>Tytuł</th><th>Argumenty</th><th>Propozycja</th><th>Wiadomość</th><th>Link</th></tr>")
+        for _, r in sub.sort_values("vs_median_pct").iterrows():
+            flags = r.get("red_flags") or []
+            flags_html = "<br>".join(f"• {str(f)}" for f in (flags if isinstance(flags, list) else []))
+            msg = (r.get("negotiation_message") or "").replace("\n", "<br>")
+            rec = r.get("recommended_offer")
+            rec_html = f"{int(float(rec))} zł" if rec and not pd.isna(rec) else ""
+            html_parts.append(
+                f"<tr><td>{r['verdict']}</td><td><b>{r['price']:.0f} zł</b></td>"
+                f"<td>{r['variant']}</td><td>{r['vs_median_pct']:+.0f}%</td>"
+                f"<td>{r['vs_new_pct']:+.0f}%</td><td>{r['title'][:80]}</td>"
+                f"<td>{flags_html}</td><td>{rec_html}</td>"
+                f"<td style='max-width:300px;'>{msg}</td>"
+                f"<td><a href='{r.get('url') or '#'}'>otwórz</a></td></tr>"
+            )
+        html_parts.append("</table>")
+    html_parts.append("</body></html>")
+    html = "\n".join(html_parts)
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"PS5 Monitor – {datetime.now().strftime('%Y-%m-%d')} ({count} ofert)"
+    msg["Subject"] = f"PS5 Monitor – {datetime.now().strftime('%Y-%m-%d')} ({len(df)} ofert)"
     msg["From"] = EMAIL_USER
     msg["To"] = EMAIL_TO
     msg.attach(MIMEText(html, "html"))
-
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
-        print("[Email] Sent")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(EMAIL_USER, EMAIL_PASS)
+            s.send_message(msg)
+        print("[Email] sent")
     except Exception as e:
-        print(f"[Email] Error: {e}")
+        print(f"[Email] error: {e}")
 
+
+# ============== MAIN ==============
 
 async def main():
     print("=" * 60)
     print(f"PS5 Monitor – {datetime.now().isoformat()}")
-    print(f"Price range: {MIN_PRICE}–{MAX_PRICE} zł")
+    print(f"Gemini: {'ON' if GEMINI_API_KEY else 'OFF'}")
     print("=" * 60)
 
-    offers_pepper = scrape_pepper()
-    all_offers.extend(offers_pepper)
+    all_offers: list[dict] = []
+
+    # Pepper (synchronously, requests-based) — per category
+    for cat in CATEGORIES.values():
+        all_offers.extend(scrape_pepper(cat))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
+            headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
-        context = await browser.new_context(
+        ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
-        page = await context.new_page()
+        page = await ctx.new_page()
 
-        offers_olx = await scrape_olx(page)
-        all_offers.extend(offers_olx)
+        for cat in CATEGORIES.values():
+            all_offers.extend(await scrape_olx(page, cat))
+            all_offers.extend(await scrape_allegro(page, cat))
+            all_offers.extend(await scrape_allegro_lokalnie(page, cat))
 
-        offers_allegro = await scrape_allegro(page)
-        all_offers.extend(offers_allegro)
+        # Dedup + analiza cenowa per kategoria
+        all_offers = deduplicate(all_offers)
+        print(f"\nTotal unique offers across categories: {len(all_offers)}")
 
-        offers_allegro_lokalnie = await scrape_allegro_lokalnie(page)
-        all_offers.extend(offers_allegro_lokalnie)
+        # Mediany per kategoria
+        cat_medians = {}
+        for cat in CATEGORIES.values():
+            prices = [o["price"] for o in all_offers if o["category"] == cat["label"]]
+            cat_medians[cat["label"]] = sorted(prices)[len(prices) // 2] if prices else 0
+
+        for o in all_offers:
+            cat = next((c for c in CATEGORIES.values() if c["label"] == o["category"]), None)
+            if cat:
+                attach_market_analysis(o, cat_medians[cat["label"]], cat["variant_fn"])
+
+        # Pobierz opis + Gemini analiza dla KAŻDEJ oferty
+        if GEMINI_API_KEY and all_offers:
+            print(f"\n[Detail+Gemini] processing {len(all_offers)} offers...")
+            for i, offer in enumerate(all_offers, 1):
+                print(f"  [{i}/{len(all_offers)}] {offer['source']} — {offer['title'][:50]}")
+                desc = await fetch_description(page, offer["source"], offer["url"])
+                offer["description"] = desc
+                analysis = gemini_analyze_offer(offer, cat_medians[offer["category"]])
+                offer["red_flags"] = analysis.get("red_flags", [])
+                offer["recommended_offer"] = analysis.get("recommended_offer")
+                offer["negotiation_message"] = analysis.get("negotiation_message", "")
+                offer["verdict_short"] = analysis.get("verdict_short", "")
+                await asyncio.sleep(GEMINI_THROTTLE_SEC)
 
         await browser.close()
 
-    all_offers[:] = deduplicate(all_offers)
-
-    print(f"\nTotal unique offers (po filtrze konsoli): {len(all_offers)}")
-
     if not all_offers:
-        print("No offers found matching criteria.")
+        print("Brak ofert.")
         save_results(all_offers)
         return
 
-    prices = [o["price"] for o in all_offers]
-    median_price = sorted(prices)[len(prices) // 2]
-    for o in all_offers:
-        analyze_offer(o, median_price)
-
     df = save_results(all_offers)
-
-    send_telegram(df)
+    send_telegram_all(df)
     send_email(df)
 
     print("=" * 60)
