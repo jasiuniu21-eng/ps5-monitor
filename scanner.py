@@ -17,6 +17,13 @@ from playwright.async_api import async_playwright
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
+STATE_DIR = Path("state")
+STATE_DIR.mkdir(exist_ok=True)
+SEEN_FILE = STATE_DIR / "seen.json"
+SEEN_TTL_DAYS = 21  # po 21 dniach „zapominamy" o ofercie — może wróciła ze zmienioną ceną
+
+# Powiadamiaj o padach tylko gdy verdykt ≤ "Dobra cena" — pady są masowe, filtruj spam.
+CONTROLLER_NOTIFY_VERDICTS = {"🟢 ŚWIETNA OKAZJA", "🟢 Dobra cena"}
 
 OLX_MAX_PAGES = 10
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -498,6 +505,41 @@ def attach_market_analysis(offer: dict, median_price: float, variant_fn) -> dict
     return offer
 
 
+# ============== SEEN STATE ==============
+
+def load_seen() -> dict:
+    """Zwróć dict {url: iso_timestamp} ofert już zaalertowanych."""
+    if not SEEN_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SEEN_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        # Usuń wpisy starsze niż TTL
+        cutoff = datetime.now().timestamp() - SEEN_TTL_DAYS * 86400
+        return {k: v for k, v in data.items()
+                if datetime.fromisoformat(v).timestamp() > cutoff}
+    except Exception as e:
+        print(f"[seen] load error: {e}")
+        return {}
+
+
+def save_seen(seen: dict):
+    try:
+        SEEN_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False))
+        print(f"[seen] saved {len(seen)} entries to {SEEN_FILE}")
+    except Exception as e:
+        print(f"[seen] save error: {e}")
+
+
+def offer_key(offer: dict) -> str:
+    """Klucz identyfikujący ofertę — preferuj URL, fallback na title+price."""
+    url = offer.get("url") or ""
+    if url:
+        return url
+    return f"{offer.get('source','')}::{offer.get('title','')}::{offer.get('price',0)}"
+
+
 # ============== STORAGE ==============
 
 def save_results(all_offers: list[dict]):
@@ -713,26 +755,42 @@ async def main():
             all_offers.extend(await scrape_allegro(page, cat))
             all_offers.extend(await scrape_allegro_lokalnie(page, cat))
 
-        # Dedup + analiza cenowa per kategoria
+        # Dedup w obrębie skanu + analiza cenowa per kategoria
         all_offers = deduplicate(all_offers)
-        print(f"\nTotal unique offers across categories: {len(all_offers)}")
+        print(f"\nTotal unique offers in this scan: {len(all_offers)}")
 
-        # Mediany per kategoria
+        # Mediany per kategoria — z PEŁNEGO zbioru (zanim odfiltrujemy seen)
         cat_medians = {}
         for cat in CATEGORIES.values():
             prices = [o["price"] for o in all_offers if o["category"] == cat["label"]]
             cat_medians[cat["label"]] = sorted(prices)[len(prices) // 2] if prices else 0
+            print(f"  mediana {cat['label']}: {cat_medians[cat['label']]} zł")
 
         for o in all_offers:
             cat = next((c for c in CATEGORIES.values() if c["label"] == o["category"]), None)
             if cat:
                 attach_market_analysis(o, cat_medians[cat["label"]], cat["variant_fn"])
 
-        # Pobierz opis + Gemini analiza dla KAŻDEJ oferty
-        if GEMINI_API_KEY and all_offers:
-            print(f"\n[Detail+Gemini] processing {len(all_offers)} offers...")
-            for i, offer in enumerate(all_offers, 1):
-                print(f"  [{i}/{len(all_offers)}] {offer['source']} — {offer['title'][:50]}")
+        # Filtr 1: pomiń oferty już zaalertowane w poprzednich skanach
+        seen = load_seen()
+        fresh = [o for o in all_offers if offer_key(o) not in seen]
+        print(f"\nSeen filter: {len(all_offers) - len(fresh)} pominięto (były już alertowane), {len(fresh)} świeżych")
+
+        # Filtr 2: dla padów — tylko świetne/dobre okazje
+        to_alert = []
+        for o in fresh:
+            if o["category"] == "Pad DualSense":
+                if o["verdict"] in CONTROLLER_NOTIFY_VERDICTS:
+                    to_alert.append(o)
+            else:
+                to_alert.append(o)
+        print(f"Quality filter: {len(to_alert)} ofert do analizy/powiadomienia (pady tylko 🟢)")
+
+        # Pobierz opis + Gemini analiza tylko dla finalnej listy
+        if GEMINI_API_KEY and to_alert:
+            print(f"\n[Detail+Gemini] processing {len(to_alert)} offers...")
+            for i, offer in enumerate(to_alert, 1):
+                print(f"  [{i}/{len(to_alert)}] {offer['source']} — {offer['title'][:50]}")
                 desc = await fetch_description(page, offer["source"], offer["url"])
                 offer["description"] = desc
                 analysis = gemini_analyze_offer(offer, cat_medians[offer["category"]])
@@ -744,14 +802,21 @@ async def main():
 
         await browser.close()
 
-    if not all_offers:
-        print("Brak ofert.")
-        save_results(all_offers)
-        return
+    # Zapisz pełny CSV wszystkich ofert ze skanu, ale notyfikuj tylko nowe
+    save_results(all_offers)
 
-    df = save_results(all_offers)
-    send_telegram_all(df)
-    send_email(df)
+    if not to_alert:
+        print("Brak nowych ofert do powiadomienia.")
+    else:
+        df_alert = pd.DataFrame(to_alert)
+        send_telegram_all(df_alert)
+        send_email(df_alert)
+
+    # Zapisz state: oznacz wszystkie zaalertowane oferty jako widziane
+    now_iso = datetime.now().isoformat()
+    for o in to_alert:
+        seen[offer_key(o)] = now_iso
+    save_seen(seen)
 
     print("=" * 60)
     print("Done.")
