@@ -26,8 +26,9 @@ SEEN_TTL_DAYS = 21  # po 21 dniach „zapominamy" o ofercie — może wróciła 
 CONTROLLER_NOTIFY_VERDICTS = {"🟢 ŚWIETNA OKAZJA", "🟢 Dobra cena"}
 
 OLX_MAX_PAGES = 10
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_THROTTLE_SEC = 4.5  # ~13 req/min, mieści się w 15 RPM free tier
+GEMINI_MODEL = "gemini-2.0-flash"   # free tier: 15 RPM, 1500 RPD (2.5 ma tylko 250 RPD)
+GEMINI_THROTTLE_SEC = 4.5            # ~13 req/min, mieści się w 15 RPM
+GEMINI_MAX_RETRIES = 3
 DETAIL_FETCH_TIMEOUT = 25000
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -434,6 +435,9 @@ Jeśli opis jest pusty/krótki - opieraj się tylko na tytule i statystykach ryn
 """
 
 
+import time as _time
+
+
 def gemini_call(prompt: str) -> dict | None:
     if not GEMINI_API_KEY:
         return None
@@ -446,21 +450,32 @@ def gemini_call(prompt: str) -> dict | None:
             "responseMimeType": "application/json",
         },
     }
-    try:
-        r = requests.post(url, json=payload, timeout=30)
-        if r.status_code != 200:
+    backoff = 8
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                text = text.strip().lstrip("`").lstrip("json").strip()
+                if text.endswith("```"):
+                    text = text.rstrip("`").strip()
+                return json.loads(text)
+            if r.status_code == 429 and attempt < GEMINI_MAX_RETRIES:
+                wait = backoff * attempt
+                print(f"[Gemini] 429 — retry {attempt}/{GEMINI_MAX_RETRIES} po {wait}s")
+                _time.sleep(wait)
+                continue
+            # Inne błędy lub ostatni 429 → log i poddaj się
             print(f"[Gemini] HTTP {r.status_code}: {r.text[:200]}")
             return None
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        # czasem mimo responseMimeType=json mogą być fence-y
-        text = text.strip().lstrip("`").lstrip("json").strip()
-        if text.endswith("```"):
-            text = text.rstrip("`").strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"[Gemini] exception: {e}")
-        return None
+        except Exception as e:
+            print(f"[Gemini] exception (attempt {attempt}): {e}")
+            if attempt < GEMINI_MAX_RETRIES:
+                _time.sleep(backoff * attempt)
+                continue
+            return None
+    return None
 
 
 def gemini_analyze_offer(offer: dict, median_price: float) -> dict:
@@ -812,10 +827,16 @@ async def main():
         send_telegram_all(df_alert)
         send_email(df_alert)
 
-    # Zapisz state: oznacz wszystkie zaalertowane oferty jako widziane
+    # Zapisz state: oznacz jako widziane TYLKO te oferty, dla których Gemini się udał
+    # (lub gdy Gemini off). W ten sposób przy 429/timeout następny skan dokończy analizę.
     now_iso = datetime.now().isoformat()
     for o in to_alert:
-        seen[offer_key(o)] = now_iso
+        gemini_ok = (
+            not GEMINI_API_KEY
+            or (o.get("negotiation_message") and o["negotiation_message"] != "(Gemini niedostępny)")
+        )
+        if gemini_ok:
+            seen[offer_key(o)] = now_iso
     save_seen(seen)
 
     print("=" * 60)
