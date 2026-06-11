@@ -463,7 +463,7 @@ def send_telegram(df: pd.DataFrame):
         f"Znaleziono *{count}* konsol w przedziale {MIN_PRICE}–{MAX_PRICE} zł\n\n"
         f"*Źródła:* OLX: {by_source.get('OLX', 0)} \\| Allegro: {by_source.get('Allegro', 0)} \\| "
         f"AllegroLok: {by_source.get('AllegroLokalnie', 0)} \\| Pepper: {by_source.get('Pepper', 0)}\n\n"
-        f"*Rynek wtórny (z dziś):*\n"
+        f"*Rynek wtórny \\(z dziś\\):*\n"
         f"  • mediana: *{price_median:.0f} zł*\n"
         f"  • średnia: {price_avg:.0f} zł\n"
         f"  • zakres: {price_min:.0f}–{price_max:.0f} zł\n\n"
